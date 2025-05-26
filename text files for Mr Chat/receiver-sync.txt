@@ -1,0 +1,103 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h> // Include this for esp_wifi_set_max_tx_power
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+typedef struct {
+    uint32_t sync_time;  // Master time in milliseconds
+} sync_packet_t;
+
+
+uint8_t sensor1_mac[] = {0xA0, 0x85, 0xE3, 0xFB, 0x52, 0x70};  // MAC of S3 watch with battery outside (V2board)
+uint8_t sensor2_mac[] = {0x88, 0x13, 0xBF, 0x25, 0x10, 0xA4};  // MAC of ECG
+
+uint32_t last_sync_time = 0;  // Last time a sync packet was sent
+
+// Callback function executed when data is received
+void onDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingData, int len) {
+    // Create a buffer to store the incoming message
+    char message[len+1];  // Add one for null terminator
+    memcpy(message, incomingData, len);
+    message[len] = '\0';  // Null-terminate the character array
+
+    // Print the received message
+    //Serial.print("Received message: ");
+    Serial.print(message);
+}
+
+void sendSyncPacket() {
+    sync_packet_t syncData;
+    syncData.sync_time = millis();  // Get master time
+
+    esp_now_send(sensor1_mac, (uint8_t *)&syncData, sizeof(syncData));
+    esp_now_send(sensor2_mac, (uint8_t *)&syncData, sizeof(syncData));
+
+    //Serial.println("Sync message sent!");
+}
+
+void sendResetPacket(){
+    sync_packet_t syncData;
+    syncData.sync_time = 0;  // Get master time
+
+    esp_now_send(sensor1_mac, (uint8_t *)&syncData, sizeof(syncData));
+    esp_now_send(sensor2_mac, (uint8_t *)&syncData, sizeof(syncData));
+
+
+}
+void setup() {
+    Serial.begin(115200);
+
+    delay(5000);
+
+
+    Serial.println("TEST");
+
+
+    // Initialize WiFi in station mode
+    WiFi.mode(WIFI_STA);
+      // Select a WiFi channel. For example, choose channel 6.
+  // The second parameter sets the secondary channel; here we use WIFI_SECOND_CHAN_NONE.
+  uint8_t channel = 6;
+  esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  if (err == ESP_OK) {
+    Serial.print("WiFi channel set to: ");
+    Serial.println(channel);
+  } else {
+    Serial.print("Error setting WiFi channel: ");
+    Serial.println(err);
+  }
+
+    // Initialize ESP-NOW
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+    else{Serial.println("ESP-NOW Initialised");}
+    
+    // Register receive callback function
+    esp_now_register_recv_cb(onDataRecv);
+     esp_now_peer_info_t peerInfo;
+    memset(&peerInfo, 0, sizeof(peerInfo));
+
+    memcpy(peerInfo.peer_addr, sensor1_mac, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    esp_now_add_peer(&peerInfo);
+
+    memcpy(peerInfo.peer_addr, sensor2_mac, 6);
+    esp_now_add_peer(&peerInfo);
+    delay(1000);
+    sendResetPacket();
+}
+
+void loop() {
+        uint32_t now = millis();
+
+    // Non-blocking sync message every 500ms
+    if (now - last_sync_time >= 120000) {
+        last_sync_time = now;
+        sendSyncPacket();
+
+    }
+}

@@ -1,0 +1,329 @@
+#include <Arduino.h>
+#include <Wire.h>                         // I2C library
+#include <Protocentral_FDC1004.h>         // FDC library
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+
+// Display headers
+#include <lvgl.h>
+#include "Arduino_GFX_Library.h"
+#include "lv_conf.h"
+
+#include "pin_config.h"
+#include "SensorQMI8658.hpp"
+
+// USB Communication header
+#include "HWCDC.h"
+
+HWCDC USBSerial;
+
+#define EXAMPLE_LVGL_TICK_PERIOD_MS 2
+#define SYS_EN 41
+#define SYS_OUT 40
+
+// LVGL Chart Defines
+#define LVGL_CHART_Y_MIN_PF 0
+#define LVGL_CHART_Y_MAX_PF 25 // Display 0-25pF range
+#define LVGL_CHART_PRECISION_MULTIPLIER 100 // For 2 decimal places on chart axis
+
+// FDC Defines
+#define UPPER_BOUND  0X4000
+#define LOWER_BOUND  (-1 * UPPER_BOUND)
+#define FDC_CHANNEL    0
+#define FDC_MEASURMENT 0
+
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t buf[LCD_WIDTH * LCD_HEIGHT / 10];
+
+SensorQMI8658 qmi;
+IMUdata acc;
+SemaphoreHandle_t lvgl_mutex;
+
+typedef struct {
+    uint32_t sync_time;
+} sync_packet_t;
+
+lv_obj_t *lvgl_label_main_title;
+lv_obj_t *lvgl_chart_fdc;
+lv_chart_series_t *lvgl_fdc_series_data;
+lv_obj_t *lvgl_label_fdc_value;
+
+// MAC address of the MASTER RECEIVER (receiver-sync.txt)
+// Using 'receiverAddress' as suggested by your compiler error implying it's already declared this way.
+uint8_t receiverAddress[] = {0x80, 0x7D, 0x3A, 0xF3, 0xBF, 0x4C}; // This IS your master receiver MAC
+
+esp_now_peer_info_t masterPeerInfo_watch;
+const uint8_t WIFI_CHANNEL_WATCH = 6;
+
+QueueHandle_t sensorDataQueue_watch;
+
+TaskHandle_t FdcDataCollectionTaskHandle = NULL;
+TaskHandle_t LvglDisplayTaskHandle = NULL;
+TaskHandle_t WatchEspNowSendTaskHandle = NULL; // Renamed handle
+
+int capdac = 0;
+
+volatile uint32_t watch_current_synced_timestamp = 0;
+volatile bool watch_time_synced_at_least_once = false;
+unsigned long watch_last_sync_ref_millis = 0;
+volatile uint32_t watch_sync_event_marker = 0;
+
+Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI);
+Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, true, LCD_WIDTH, LCD_HEIGHT, 0, 20, 0, 0);
+
+#if LV_USE_LOG != 0
+void watch_lvgl_serial_print(const char *log_buf) {
+  USBSerial.printf("%s", log_buf); USBSerial.flush();
+}
+#endif
+
+void watch_lvgl_display_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
+  uint32_t w = (area->x2 - area->x1 + 1);
+  uint32_t h = (area->y2 - area->y1 + 1);
+#if (LV_COLOR_16_SWAP != 0)
+  gfx->draw16bitBeRGBBitmap(area->x1, area->y1, (uint16_t *)&color_p->full, w, h);
+#else
+  gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)&color_p->full, w, h);
+#endif
+  lv_disp_flush_ready(disp);
+}
+
+void watch_lvgl_tick_increment(void *arg) { lv_tick_inc(EXAMPLE_LVGL_TICK_PERIOD_MS); }
+
+static uint8_t watch_system_reboot_count = 0;
+void watch_trigger_reboot(void *arg) {
+  watch_system_reboot_count++;
+  if (watch_system_reboot_count >= 30) { ESP.restart(); }
+}
+
+void watch_on_sync_data_recv(const esp_now_recv_info *recv_info, const uint8_t *incomingData, int len) {
+    if (len == sizeof(sync_packet_t)) {
+        sync_packet_t syncData;
+        memcpy(&syncData, incomingData, sizeof(syncData));
+        if (syncData.sync_time == 0) {
+            watch_current_synced_timestamp = 0;
+            watch_last_sync_ref_millis = millis();
+            watch_time_synced_at_least_once = false;
+            watch_sync_event_marker = 0;
+            USBSerial.println("Watch: RESET sync received.");
+        } else {
+            watch_current_synced_timestamp = syncData.sync_time;
+            watch_last_sync_ref_millis = millis();
+            watch_time_synced_at_least_once = true;
+            watch_sync_event_marker = 1;
+        }
+    }
+}
+
+void FdcDataCollectionTask(void *pvParameters) {
+  FDC1004 FDC_sensor;
+  char data_string_buffer[60]; // Buffer for "CvalueTtimestamp\n"
+  int buffer_write_offset;
+
+  USBSerial.println("Watch: FDC Task started (Targeting ~100Hz).");
+  unsigned long loop_start_time; // For measuring loop execution time (optional debug)
+
+  while (1) {
+    // loop_start_time = millis(); // Optional: for debugging loop time
+    buffer_write_offset = 0;
+
+    if(digitalRead(SYS_OUT) == 0){
+      USBSerial.println("Watch: Power button. Shutting down.");
+      digitalWrite(SYS_EN, LOW);
+    }
+    
+    int32_t capacitance_tx_femtofarads;
+
+    // Configure FDC for a fast conversion rate, e.g., 200Hz or 400Hz
+    // This ensures the FDC reading itself is quick.
+    FDC_sensor.configureMeasurementSingle(FDC_MEASURMENT, FDC_CHANNEL, capdac);
+    FDC_sensor.triggerSingleMeasurement(FDC_MEASURMENT, FDC1004_400HZ); // 400Hz rate = ~2.5ms conversion
+    
+    // Wait for FDC measurement to complete.
+    // For 400Hz, conversion is ~2.5ms. A 3-4ms delay should be safe.
+    vTaskDelay(pdMS_TO_TICKS(4)); 
+    
+    uint16_t fdc_raw[2];
+    if (!FDC_sensor.readMeasurement(FDC_MEASURMENT, fdc_raw)) {
+      int16_t msb = (int16_t)fdc_raw[0];
+      capacitance_tx_femtofarads = (((int32_t)457 * msb) / 1000) + ((int32_t)3028 * capdac);
+      if (watch_sync_event_marker == 1) { capacitance_tx_femtofarads = 25000; watch_sync_event_marker = 0; }
+      if (msb > UPPER_BOUND && capdac < FDC1004_CAPDAC_MAX) capdac++;
+      else if (msb < LOWER_BOUND && capdac > 0) capdac--;
+    } else { 
+      capacitance_tx_femtofarads = 0; // Default on failure
+    }
+ 
+    // Timestamping (same logic as before, robust)
+    unsigned long current_capture_ms = millis();
+    uint32_t timestamp_tx;
+    if (watch_time_synced_at_least_once) {
+        timestamp_tx = watch_current_synced_timestamp + (current_capture_ms - watch_last_sync_ref_millis);
+    } else { 
+        timestamp_tx = (watch_current_synced_timestamp == 0 && !watch_time_synced_at_least_once) ? 0 : watch_current_synced_timestamp + (current_capture_ms - watch_last_sync_ref_millis);
+    }
+
+    // Format data string
+    buffer_write_offset += snprintf(data_string_buffer + buffer_write_offset, sizeof(data_string_buffer) - buffer_write_offset, "C%05ld", capacitance_tx_femtofarads);
+    buffer_write_offset += snprintf(data_string_buffer + buffer_write_offset, sizeof(data_string_buffer) - buffer_write_offset, "T%08lu\n", timestamp_tx);
+    
+    // Send to queue
+    if (buffer_write_offset > 0) {
+        if (xQueueSend(sensorDataQueue_watch, (void *)data_string_buffer, pdMS_TO_TICKS(2)) != pdTRUE) { // Shorter timeout
+            // USBSerial.println("Watch: FDC Queue full!");
+        }
+    }
+    
+    // LVGL Update (keep this brief or make it less frequent if it's a bottleneck)
+    float display_pf = (float)capacitance_tx_femtofarads / 1000.0;
+    int16_t chart_val = (int16_t)(display_pf * LVGL_CHART_PRECISION_MULTIPLIER);
+    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(1)) == pdTRUE) { // Very short, non-blocking attempt
+        lv_chart_set_next_value(lvgl_chart_fdc, lvgl_fdc_series_data, chart_val);
+        char lbl_str[30]; snprintf(lbl_str, sizeof(lbl_str), "FDC: %.2f pF", display_pf);
+        lv_label_set_text(lvgl_label_fdc_value, lbl_str);
+        xSemaphoreGive(lvgl_mutex);
+    }
+
+    // Calculate remaining delay to achieve target overall loop rate of ~10ms (100Hz)
+    // The operations above (FDC read, format, queue, LVGL attempt) will take some time.
+    // Let's say they take roughly 5-6ms (FDC wait 4ms + ~1-2ms processing).
+    // To get a total of 10ms, we need an additional delay of ~4-5ms.
+    // This is an approximation; precise timing would require measuring execution time.
+    // We used vTaskDelay(4) for FDC. Let's add vTaskDelay(5) to aim for ~9-10ms total.
+    vTaskDelay(pdMS_TO_TICKS(5)); // Adjust this to fine-tune rate.
+                                  // Total delay in loop ~4ms + 5ms = 9ms. -> ~110 Hz. Close to 100Hz.
+                                  // If processing is faster, you might need a slightly larger delay here.
+
+    // unsigned long loop_end_time = millis(); // Optional debug
+    // USBSerial.printf("FDC Loop Time: %lu ms\n", loop_end_time - loop_start_time); // Optional debug
+  }
+}
+
+void WatchEspNowSendTask(void *pvParameters) {
+  char send_buf[60]; 
+  USBSerial.println("Watch: ESP-NOW Send Task started.");
+  while (true) {
+    if (xQueueReceive(sensorDataQueue_watch, &send_buf, portMAX_DELAY)) {
+        if (watch_time_synced_at_least_once || watch_current_synced_timestamp != 0) {
+            // Using 'receiverAddress' as it's likely the declared one
+            esp_now_send(receiverAddress, (uint8_t *)send_buf, strlen(send_buf));
+        }
+    }
+  }
+}
+
+void LvglDisplayTask(void *pvParameters) {
+  USBSerial.println("Watch: LVGL Task started.");
+  while (true) {
+    if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY) == pdTRUE) {
+      lv_timer_handler();
+      xSemaphoreGive(lvgl_mutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(EXAMPLE_LVGL_TICK_PERIOD_MS));
+  }
+}
+
+void setup() {
+  pinMode(SYS_EN, OUTPUT); digitalWrite(SYS_EN, HIGH); 
+  pinMode(SYS_OUT, INPUT);    
+  USBSerial.begin(115200); 
+  unsigned long t_start = millis(); while(!USBSerial && (millis()-t_start < 3000)) delay(10);
+  USBSerial.println("\n--- FDC1004 Watch (ESP-NOW Sync - v8 Corrected MAC Name) ---");
+
+  Wire.begin(IIC_SDA, IIC_SCL); USBSerial.println("Watch: I2C Initialized.");
+
+  WiFi.mode(WIFI_STA); delay(100); 
+  USBSerial.print("Watch MAC: "); USBSerial.println(WiFi.macAddress()); 
+
+  esp_err_t ch_err = esp_wifi_set_channel(WIFI_CHANNEL_WATCH, WIFI_SECOND_CHAN_NONE);
+  if (ch_err == ESP_OK) { USBSerial.printf("Watch: WiFi channel set to %d\n", WIFI_CHANNEL_WATCH); }
+  else { USBSerial.printf("Watch: Error setting WiFi channel: %s\n", esp_err_to_name(ch_err)); }
+  
+  if (esp_now_init() != ESP_OK) { ESP.restart(); }
+  USBSerial.println("Watch: ESP-NOW Initialized.");
+  esp_now_register_recv_cb(watch_on_sync_data_recv); 
+
+  memset(&masterPeerInfo_watch, 0, sizeof(masterPeerInfo_watch)); 
+  // Using 'receiverAddress' for consistency with its likely declaration
+  memcpy(masterPeerInfo_watch.peer_addr, receiverAddress, 6);
+  masterPeerInfo_watch.channel = WIFI_CHANNEL_WATCH; 
+  masterPeerInfo_watch.encrypt = false;
+  if (esp_now_add_peer(&masterPeerInfo_watch) != ESP_OK) { USBSerial.println("Watch: Failed to add master peer."); }
+  else { USBSerial.println("Watch: Master peer added."); }
+  watch_last_sync_ref_millis = millis(); 
+  
+  lvgl_mutex = xSemaphoreCreateMutex(); gfx->begin();
+  pinMode(LCD_BL, OUTPUT); digitalWrite(LCD_BL, HIGH); // Using LCD_BL from pin_config.h
+  pinMode(38, OUTPUT); digitalWrite(38, HIGH);     // From your original
+  
+  USBSerial.printf("Watch: LVGL v%d.%d.%d\n", lv_version_major(), lv_version_minor(), lv_version_patch());
+  lv_init();
+#if LV_USE_LOG != 0
+  lv_log_register_print_cb(watch_lvgl_serial_print); 
+#endif
+  lv_disp_draw_buf_init(&draw_buf, buf, NULL, LCD_WIDTH * LCD_HEIGHT / 10); 
+  static lv_disp_drv_t disp_drv; lv_disp_drv_init(&disp_drv);
+  disp_drv.hor_res = LCD_WIDTH; disp_drv.ver_res = LCD_HEIGHT;
+  disp_drv.flush_cb = watch_lvgl_display_flush; disp_drv.draw_buf = &draw_buf;
+  lv_disp_drv_register(&disp_drv);
+  // static lv_indev_drv_t indev_drv; lv_indev_drv_init(&indev_drv); // Commented out to fix LVGL warnings
+  // indev_drv.type = LV_INDEV_TYPE_POINTER; lv_indev_drv_register(&indev_drv);
+
+  lvgl_label_main_title = lv_label_create(lv_scr_act()); 
+  lv_label_set_text(lvgl_label_main_title, "FDC1004 Watch");
+  lv_obj_align(lvgl_label_main_title, LV_ALIGN_TOP_MID, 0, 5); 
+
+  lvgl_chart_fdc = lv_chart_create(lv_scr_act());
+  lv_obj_set_size(lvgl_chart_fdc, LCD_WIDTH - 20, LCD_HEIGHT - 60); 
+  lv_obj_align(lvgl_chart_fdc, LV_ALIGN_CENTER, 0, 0); 
+  lv_chart_set_type(lvgl_chart_fdc, LV_CHART_TYPE_LINE);                                   
+  lv_chart_set_range(lvgl_chart_fdc, LV_CHART_AXIS_PRIMARY_Y, 
+                     LVGL_CHART_Y_MIN_PF * LVGL_CHART_PRECISION_MULTIPLIER, 
+                     LVGL_CHART_Y_MAX_PF * LVGL_CHART_PRECISION_MULTIPLIER); 
+  lv_chart_set_point_count(lvgl_chart_fdc, 50);                                          
+  lvgl_fdc_series_data = lv_chart_add_series(lvgl_chart_fdc, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
+  
+  lv_obj_set_style_text_font(lvgl_chart_fdc, &lv_font_montserrat_14, LV_PART_TICKS); 
+  lv_chart_set_axis_tick(lvgl_chart_fdc, LV_CHART_AXIS_PRIMARY_Y, 5, 2, 
+                         (LVGL_CHART_Y_MAX_PF - LVGL_CHART_Y_MIN_PF) / 4 == 0 ? 1 : (LVGL_CHART_Y_MAX_PF - LVGL_CHART_Y_MIN_PF) / 4, 
+                         2, true, 40);
+
+  lvgl_label_fdc_value = lv_label_create(lv_scr_act()); 
+  lv_label_set_text(lvgl_label_fdc_value, "FDC: --- pF"); 
+  lv_obj_set_style_text_color(lvgl_label_fdc_value, lv_palette_main(LV_PALETTE_BLUE), LV_PART_MAIN); 
+  lv_obj_set_style_text_font(lvgl_label_fdc_value, &lv_font_montserrat_14, LV_PART_MAIN);           
+  lv_obj_align(lvgl_label_fdc_value, LV_ALIGN_BOTTOM_MID, 0, -5); 
+  
+  const esp_timer_create_args_t tick_args = { .callback = &watch_lvgl_tick_increment, .name = "lvgl_tick"};
+  esp_timer_handle_t tick_timer_h; 
+  esp_timer_create(&tick_args, &tick_timer_h);
+  esp_timer_start_periodic(tick_timer_h, EXAMPLE_LVGL_TICK_PERIOD_MS * 1000);
+  USBSerial.println("Watch: LVGL Setup Complete.");
+
+  if (!qmi.begin(Wire, QMI8658_L_SLAVE_ADDRESS)) { USBSerial.println("Watch: QMI8658 init failed."); }
+  else {
+    USBSerial.println("Watch: QMI8658 Initialized.");
+    qmi.configAccelerometer(SensorQMI8658::ACC_RANGE_4G, SensorQMI8658::ACC_ODR_1000Hz, SensorQMI8658::LPF_MODE_0);
+    qmi.enableAccelerometer();
+  }
+  
+  sensorDataQueue_watch = xQueueCreate(10, sizeof(char) * 60);  
+  if (!sensorDataQueue_watch) { USBSerial.println("Watch: Error creating queue. Halting."); while (1); }
+  USBSerial.println("Watch: Sensor data queue created.");
+
+  xTaskCreatePinnedToCore(FdcDataCollectionTask, "FDC_Task", 4096, NULL, 3, &FdcDataCollectionTaskHandle, 0); 
+  xTaskCreatePinnedToCore(WatchEspNowSendTask, "NOW_Send_Task", 4096, NULL, 2, &WatchEspNowSendTaskHandle, 0); // Corrected handle
+  xTaskCreatePinnedToCore(LvglDisplayTask, "LVGL_Task", 4096, NULL, 1, &LvglDisplayTaskHandle, 1); 
+
+  USBSerial.println("Watch: All setup complete.");
+}
+
+void loop() {
+  vTaskDelay(pdMS_TO_TICKS(100)); 
+}
