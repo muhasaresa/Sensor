@@ -104,7 +104,7 @@ void FdcDataCollectionTask(void *pvParameters) {
 
     FDC_sensor.configureMeasurementSingle(FDC_MEASURMENT, FDC_CHANNEL, capdac);
     FDC_sensor.triggerSingleMeasurement(FDC_MEASURMENT, FDC1004_200HZ); 
-    vTaskDelay(pdMS_TO_TICKS(7)); 
+    vTaskDelay(pdMS_TO_TICKS(6)); 
     
     uint16_t fdc_raw[2];
     if (!FDC_sensor.readMeasurement(FDC_MEASURMENT, fdc_raw)) {
@@ -133,7 +133,7 @@ void FdcDataCollectionTask(void *pvParameters) {
             // USBSerial.println("Watch: FDC Queue full!");
         }
     }
-    vTaskDelay(pdMS_TO_TICKS(2)); // Approx 7ms FDC wait + 1ms proc + 2ms delay = ~10ms loop (100Hz)
+    vTaskDelay(pdMS_TO_TICKS(3)); // Approx 7ms FDC wait + 1ms proc + 2ms delay = ~10ms loop (100Hz)
   }
 }
 
@@ -183,7 +183,7 @@ void setup() {
   USBSerial.println("Watch: LVGL Display is DISABLED.");
   pinMode(LCD_BL, OUTPUT);    // LCD_BL is defined in pin_config.h
   digitalWrite(LCD_BL, LOW);  // Turn Backlight OFF (assuming LOW is OFF)
-  pinMode(38, OUTPUT); digitalWrite(38, HIGH); // Keep as per your original setup if it controls display power
+  pinMode(38, OUTPUT); digitalWrite(38, LOW); // Keep as per your original setup if it controls display power
   // --- End LVGL Display Disabled ---
 
   if (!qmi.begin(Wire, QMI8658_L_SLAVE_ADDRESS)) { USBSerial.println("Watch: QMI8658 init failed."); }

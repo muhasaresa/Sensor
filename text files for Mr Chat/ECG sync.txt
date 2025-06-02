@@ -1,6 +1,7 @@
 //////////////////////////////////////////////////////////////////////////////////////////
 //
 //    MAX30001 ESP-NOW ECG Sender - Sending RAW Values & Synced
+//    Increased Sampling/Sending Rate
 //
 //    - Reads raw ECG data from MAX30001.
 //    - Sends this raw signed long ECG value (as a string) and synchronized
@@ -23,7 +24,9 @@
 #define MAX30001_CS_PIN   5
 #define MAX30001_INT1_PIN 2
 
-#define DATA_SEND_INTERVAL_MS 100 // Interval for sending ECG data (~10 Hz)
+// Interval for reading from MAX30001 and sending ECG data via ESP-NOW
+#define DATA_SEND_INTERVAL_MS 10 // Approx 200 Hz (was 100ms for 10Hz)
+                                 // Adjust this based on desired detail vs. ESP-NOW load
 
 MAX30001 max30001(MAX30001_CS_PIN);
 
@@ -59,6 +62,7 @@ void onSyncDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingD
             current_synced_timestamp_ms = syncData.sync_time;
             last_loop_run_millis_ref = millis();
             time_synced_at_least_once = true;
+            // Serial.printf("ECG: SYNC received. Master time: %lu\n", syncData.sync_time);
         }
     }
 }
@@ -67,7 +71,7 @@ void setup() {
     Serial.begin(115200);
     unsigned long setup_start_time = millis();
     while (!Serial && (millis() - setup_start_time < 3000)) { delay(10); }
-    Serial.println("\n--- MAX30001 ESP-NOW ECG Sender (RAW Values, Synced) ---");
+    Serial.println("\n--- MAX30001 ESP-NOW ECG Sender (RAW Values, Synced, 50Hz Target) ---");
 
     pinMode(MAX30001_CS_PIN, OUTPUT);
     digitalWrite(MAX30001_CS_PIN, HIGH);
@@ -77,6 +81,9 @@ void setup() {
     Serial.println("Detecting MAX30001...");
     if (max30001.max30001ReadInfo()) {
         Serial.println("MAX30001 Detected. Initializing...");
+        // Consider if max30001.BeginECGBioZ(); needs different parameters for higher sampling rates
+        // if the library supports it and if the default isn't already high enough.
+        // For now, using default configuration.
         max30001.BeginECGBioZ();
         sensorInitialized = true;
         Serial.println("MAX30001 Initialized.");
@@ -110,7 +117,7 @@ void setup() {
     esp_now_register_recv_cb(onSyncDataRecv);
 
     memcpy(masterPeerInfo.peer_addr, masterReceiverMacAddress, 6);
-    masterPeerInfo.channel = WIFI_CHANNEL; // Or 0 if using current channel
+    masterPeerInfo.channel = WIFI_CHANNEL; 
     masterPeerInfo.encrypt = false;
     if (esp_now_add_peer(&masterPeerInfo) != ESP_OK) {
         Serial.println("Failed to add master peer. Halting.");
@@ -121,17 +128,18 @@ void setup() {
     last_loop_run_millis_ref = millis();
 
     Serial.println("--- End of Setup ---");
-    Serial.println("Starting RAW ECG data transmission...");
+    Serial.println("Starting RAW ECG data transmission at ~200Hz...");
 }
 
 void loop() {
     if (!sensorInitialized) {
-        delay(1000);
+        delay(1000); // Wait if sensor not ready
         return;
     }
 
     unsigned long current_millis_val = millis();
 
+    // Update synced timestamp based on local millis progression
     if (time_synced_at_least_once) {
          current_synced_timestamp_ms += (current_millis_val - last_loop_run_millis_ref);
     }
@@ -141,21 +149,21 @@ void loop() {
     if (current_millis_val - last_send_time_millis >= DATA_SEND_INTERVAL_MS) {
         last_send_time_millis = current_millis_val;
 
-        if (time_synced_at_least_once || current_synced_timestamp_ms != 0) {
+        if (time_synced_at_least_once || current_synced_timestamp_ms != 0) { // Send if time seems valid
             ecg_data_raw_current = max30001.getECGSamples(); // Get raw ECG data
 
-            char data_buffer[50]; // Buffer for "E<raw_value>T<timestamp>\n"
-                                  // A signed long can be up to 10-11 digits + sign.
-                                  // "E-1234567890T01234567\n" needs ~25 chars. 50 is safe.
+            char data_buffer[50]; // Sufficient for "E<signed_long>T<uint32_t>\n"
             
             // Format the raw signed long ECG value and the timestamp
             snprintf(data_buffer, sizeof(data_buffer), "E%ldT%08lu\n", ecg_data_raw_current, current_synced_timestamp_ms);
 
-            esp_err_t sendStatus = esp_now_send(masterReceiverMacAddress, (uint8_t *)data_buffer, strlen(data_buffer));
+            esp_now_send(masterReceiverMacAddress, (uint8_t *)data_buffer, strlen(data_buffer));
             
             // Optional Debugging:
-            // Serial.printf("Sent RAW: %s", data_buffer); // data_buffer already includes \n
-            // if(sendStatus != ESP_OK) { Serial.printf("ESP-NOW Send Error: %s\n", esp_err_to_name(sendStatus));}
+            // Serial.printf("Sent RAW: %s", data_buffer); 
         }
     }
+    // The main control for sampling rate is now the DATA_SEND_INTERVAL_MS check.
+    // If DATA_SEND_INTERVAL_MS is very small (e.g. < 5ms), a tiny `delay(1)` might be 
+    // beneficial to allow other tasks (like WiFi handling) to run, but for 20ms, it's likely fine without.
 }
