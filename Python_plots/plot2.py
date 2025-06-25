@@ -157,7 +157,7 @@ class LivePlotter:
             if not line: continue
             try:
                 s = line.decode("ascii", "replace").strip()
-                print(f"DEBUG: Raw line received: '{s}'") # <<< PRINT RAW LINE
+                #print(f"DEBUG: Raw line received: '{s}'") # <<< PRINT RAW LINE
 
                 if not s: continue
 
@@ -182,14 +182,14 @@ class LivePlotter:
                     c_idx = s.find("C")
                     if c_idx != -1 and c_idx < t_idx:
                         val_str_coer = s[c_idx + 1:t_idx]
-                        print(f"DEBUG COER: Found 'C'. Extracted val_str_coer: '{val_str_coer}' from full line: '{s}'")
+                        #print(f"DEBUG COER: Found 'C'. Extracted val_str_coer: '{val_str_coer}' from full line: '{s}'")
                         if is_int_string(val_str_coer):
                             fF = int(val_str_coer)
                             pF = fF / 1000.0
                             self.streams[self.sensor_indices["Coer Sensor"]].append((rel_ms, pF))
                             if self.recording and "C" in self.csv:
                                 self.csv["C"].write(f"{ts_sec:+.6E},{fF * 1e-15:+.6E}\n")
-                            print(f"DEBUG COER: Successfully parsed value: {pF} pF")
+                            #print(f"DEBUG COER: Successfully parsed value: {pF} pF")
                         else:
                             print(f"DEBUG COER: val_str_coer '{val_str_coer}' is NOT a valid integer string.")
                     # Optional: Add an else here if you want to know if 'C' was found but not before 'T'
