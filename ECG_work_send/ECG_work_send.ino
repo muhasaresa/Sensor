@@ -25,7 +25,7 @@
 #define MAX30001_INT1_PIN 2
 
 // Interval for reading from MAX30001 and sending ECG data via ESP-NOW
-#define DATA_SEND_INTERVAL_MS 10 // Approx 100 Hz (was 100ms for 10Hz)
+#define DATA_SEND_INTERVAL_MS 8 // Approx 100 Hz (was 100ms for 10Hz)
                                  // Adjust this based on desired detail vs. ESP-NOW load
 
 MAX30001 max30001(MAX30001_CS_PIN);
@@ -71,7 +71,7 @@ void setup() {
     Serial.begin(115200);
     unsigned long setup_start_time = millis();
     while (!Serial && (millis() - setup_start_time < 3000)) { delay(10); }
-    Serial.println("\n--- MAX30001 ESP-NOW ECG Sender (RAW Values, Synced, 50Hz Target) ---");
+    Serial.println("\n--- MAX30001 ESP-NOW ECG Sender (RAW Values, Synced, 125Hz Target) ---");
 
     pinMode(MAX30001_CS_PIN, OUTPUT);
     digitalWrite(MAX30001_CS_PIN, HIGH);

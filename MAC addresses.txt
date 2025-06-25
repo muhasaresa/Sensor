@@ -1,0 +1,5 @@
+MAC address receiver: 80:7D:3A:F3:BF:4C
+MAC address watch: A0:85:E3:FB:52:70
+MAC address ECG: 88:13:BF:25:10:A4
+
+
